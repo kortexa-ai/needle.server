@@ -31,9 +31,31 @@ One server, installed as a native system service:
 - Ubuntu and other `systemd` Linux machines, as a `systemd` service
 - Raspberry Pi 5, as a `systemd` service
 
-## Status
+## Use it
 
-Early. Nothing runs yet.
+```sh
+./setup.sh   # Python dependencies, plus the pinned upstream runner and weights
+./run.sh     # serves on port 4007
+```
+
+```sh
+curl -s http://localhost:4007/complete -H 'Content-Type: application/json' -d '{
+  "input": "lock the front door",
+  "tools": [{"name": "lock_door", "description": "Lock a door",
+             "parameters": {"type": "object", "properties": {"door": {"type": "string"}}, "required": ["door"]}}]
+}'
+```
+
+[`llms.txt`](llms.txt) is the full client contract, written so that a coding
+agent can generate a client from it. A running server also serves it at
+`/llms.txt`, next to `/openapi.json`, `/health` and `/models`.
+
+The service definitions are in `launchd/` and `systemd/`. The design, and the
+measurements behind it, are in [`PLAN.md`](PLAN.md).
+
+```sh
+.venv/bin/python -m pytest   # the integration tests need ./setup.sh first
+```
 
 ## License
 

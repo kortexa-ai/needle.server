@@ -47,17 +47,24 @@ turns, queue time. Confidence gating is the client's job; `llms.txt` teaches it.
 Also: `GET /health`, `GET /models`, `GET /llms.txt`. FastAPI serves
 `/openapi.json` for free.
 
-Errors: `400` input too long or history cannot fit, `429` + `Retry-After` queue
-full, `504` deadline passed (the worker is killed and replaced).
+Errors: `400` a limit was passed or the tools are malformed, `429` +
+`Retry-After` queue full, `503` a worker failed, `504` deadline passed (the
+worker is killed and replaced). History that does not fit is dropped, not refused.
 
 ## Limits
 
 Constants, not configuration, until a real client needs otherwise.
 
 - Latest `input`: 2,000 characters. Over the limit is a `400`, never a silent cut.
+- `input` plus replayed `history`: 4,000 characters, about 1.3 s of engine time
+  at worst. Without this, six full-size turns would pass the deadline.
 - `history`: at most 6 replayed turns. Older turns drop first, in whole
   exchanges, so a replay never starts on a tool result.
-- Request deadline: 5 s.
+- `tools`: 1 to 20, at most 32,000 characters of JSON. Starting an engine costs
+  about 1 s for 20 tools and grows faster than the tool count.
+- `system`: 500 characters.
+- Request deadline: 5 s. `--fail-input-overflow` is set, but it never fired in
+  tests: 16 KB of input still answered after 11 s. Latency is the real limit.
 
 ## Pool
 
@@ -84,34 +91,39 @@ wait in a bounded FIFO queue; a full queue answers `429`.
 
 - `setup.sh` creates `.venv/` and fetches the runner and weights for this
   platform from a pinned Hugging Face revision, with checksums.
-- `run.sh` starts the front server. `launchd/*.plist` and `systemd/*.service`
+- `run.sh` starts the front server on port 4007. `launchd/*.plist` and `systemd/*.service`
   follow the layout the other Kortexa servers use, so `ktxsvc` finds them.
 - Workers always run with `NEEDLE_TELEMETRY=0` and `DO_NOT_TRACK=1`.
 - The systemd unit sets no `CPUAffinity` and no `CPUQuota`: confining the
   engine made it 40-80x slower.
 
-## Build order
+## Code map
 
-1. Skeleton: `pyproject.toml`, `setup.sh`, `run.sh`, `.gitignore` entries.
-2. Worker (spawn, ready, reset, complete, kill) and pool (key, LRU, memory cap,
-   idle stop) with the global throttle.
-3. HTTP API, limits, errors, `/health`, `/models`.
-4. Tests: pool, throttle and limits against a stub runner; one integration
-   test against the real runner.
-5. `llms.txt`: our endpoint, fields, limits, errors, the history contract and
-   a confidence-gating recipe. It links to upstream's guides for tool design.
-6. `launchd` and `systemd` units; pick a free port from
-   `api.server/SERVICES_MAPPING.md`.
-7. Validate on macOS, then on a Raspberry Pi 5.
+- `needle_server/worker.py` - one runner process: spawn, ready, reset, complete, stop.
+- `needle_server/pool.py` - toolset key, LRU replacement, memory cap, idle stop, throttle, queue.
+- `needle_server/app.py` - the HTTP API, the limits and the history fitting.
+- `tests/stub_runner.py` - a stand-in runner that copies the real parser's quirks.
+- `tests/test_integration.py` - the same API against the real runner.
 
-## To verify while building
+## What the runner taught us
 
-- That a `date:` fact without a time of day is enough. Day granularity keeps
-  workers reusable all day; clients that need minute precision send their own.
-- That `--threads` does anything. It made no difference on an M4 Pro. This
+- Its request parser is hand-rolled. `{"input": "..."}` with a space after the
+  colon is read as an empty input, and `\uXXXX` escapes are not decoded, both
+  without any error. `worker.encode()` sends the one form it reads correctly,
+  and the integration tests guard it.
+- It loads a malformed toolset as "no tools" and then refuses everything. The
+  server checks the tool shape and answers `tools_invalid` instead.
+- A `date:` fact without a time of day works: "tomorrow" resolves correctly.
+  Without any date fact the model invents a date, so the server always adds one.
+
+## Still open
+
+- Whether `--threads` does anything. It made no difference on an M4 Pro. This
   must be known before running on a shared Linux machine.
-- Whether a long-lived worker's memory grows. If it does, recycle workers after
-  a fixed number of requests.
+- Whether a long-lived worker's memory grows. Reported `peak_ram_mb` crept up
+  by about 1 MB per worker over 100 requests. If it keeps growing, recycle
+  workers after a fixed number of requests.
+- Validation on Linux and on a Raspberry Pi 5.
 
 ## Not now
 

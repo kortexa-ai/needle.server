@@ -1,0 +1,37 @@
+[Unit]
+Description=Kortexa Needle Server
+After=network.target
+
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+
+User=francip
+Group=francip
+
+WorkingDirectory=/home/francip/src/needle.server
+
+Environment=PATH=/home/francip/.local/bin:/home/francip/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/francip/src/needle.server
+
+ExecStart=/home/francip/src/needle.server/run.sh
+
+Restart=always
+RestartSec=15
+
+TimeoutStopSec=30
+
+# No CPUAffinity and no CPUQuota: the engine's threads spin while they wait,
+# and confining them made it 40-80x slower.
+
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/francip/src/needle.server
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

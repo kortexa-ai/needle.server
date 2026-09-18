@@ -1,0 +1,208 @@
+# needle.server
+
+> needle.server turns plain language into tool calls. You send text plus the tools your app exposes; it answers with a well-formed JSON tool call and a confidence score. It runs Cactus Needle 3, a tiny (29-121M parameter) on-device model that does tool calling and nothing else: it never writes prose. One HTTP endpoint, no authentication, no sessions, no SDK.
+
+This file is written for AI coding assistants. It is enough to write a correct client without reading the source. Copy the patterns; do not invent fields that are not listed here. The exact schema is at `GET /openapi.json` on a running server. Upstream's guides cover the model itself: tool design at https://cactuscompute.com/blog/designing-tools-for-needle and confidence at https://cactuscompute.com/blog/needle-confidence.
+
+Default base URL: `http://<host>:4007`.
+
+## The one endpoint
+
+`POST /complete` with a JSON body:
+
+```json
+{
+  "input": "dim the living room to 30",
+  "tools": [{
+    "name": "set_lights",
+    "description": "Turn a room's lights on or off and set brightness",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "room": {"type": "string"},
+        "on": {"type": "boolean"},
+        "brightness": {"type": "integer", "minimum": 0, "maximum": 100}
+      },
+      "required": ["room", "on"]
+    }
+  }],
+  "system": "locale: en-US; device: speaker",
+  "history": []
+}
+```
+
+- `input` (string, required) - the latest thing to act on: the user's words, or, after you ran a tool, the results as a JSON string (see Multi-turn).
+- `tools` (array, required, 1 to 20) - JSON-schema tool definitions. The compact form above and the OpenAI form (`{"type": "function", "function": {...}}`) both work.
+- `system` (string, optional) - facts about the environment, never instructions. See System facts.
+- `history` (array of strings, optional) - your earlier `input` values in this conversation, oldest first. See Multi-turn.
+
+Unknown fields are ignored.
+
+## The response
+
+The engine's own envelope, unchanged, plus a `server` object:
+
+```json
+{
+  "type": "call",
+  "success": true,
+  "error": null,
+  "error_code": null,
+  "reason": null,
+  "function_calls": [{"name": "set_lights", "arguments": {"room": "living room", "on": true, "brightness": 30}}],
+  "suppressed_calls": [],
+  "reasoning": "'living room' -> room; '30' -> brightness",
+  "confidence": 0.94,
+  "validation": {"ungrounded": [], "negation": false},
+  "prefill_tps": 2300.0,
+  "decode_tps": 1200.0,
+  "peak_ram_mb": 92.5,
+  "server": {"worker": "warm", "replayed_turns": 0, "dropped_history": 0, "queue_ms": 0.1, "engine_ms": 41.0}
+}
+```
+
+- `function_calls` - a list of `{"name", "arguments"}`, in the order to run them. `arguments` is an object (not a string) and is grammar-guaranteed to match your schema.
+- `type` - `"call"` when the model wants tools run (an empty `function_calls` is a refusal); `"respond"` when the exchange is finished, which is what you get after feeding back tool results. There is never any text to show the user.
+- `confidence` - calibrated score in [0, 1]. You must gate on it; see below.
+- `suppressed_calls` - a call the engine withheld because its confidence was under 0.1. `function_calls` is then empty. Offer it to the user to confirm, or treat the turn as a refusal.
+- `reasoning` - a terse derivation of each argument. Useful in logs and confirmation prompts, not as an answer.
+- `validation.ungrounded` - `tool.field` names whose value does not appear literally in the input. Advisory: a date the model resolved from "tomorrow" is listed here even though it is correct.
+- `server.worker` - `warm` (an engine already held this toolset), `spawned` or `replaced` (one had to start; slower).
+- `server.dropped_history` - how many of your `history` entries were not replayed because of the limits.
+
+## Behaviour contract (read this before writing code)
+
+- The server is stateless. Nothing is remembered between requests. A conversation exists only in the `history` you send.
+- An off-topic or unsupported request returns an empty `function_calls`. That is the refusal. There is no free-text fallback; always handle the empty case.
+- Arguments contain only values evidenced in the input. Optional fields with no evidence are omitted, not guessed. Never assume an optional key exists.
+- One request can produce several calls ("turn off the lights and lock the door"); run them in order.
+- A high confidence is not a guarantee. Wrong calls have been observed at 0.86. Anything destructive or irreversible deserves a confirmation regardless of the score.
+- Keep conversations short. The model reliably uses the last few turns only; recall of older turns fails without any error.
+
+## Confidence gating
+
+Pick a threshold per product. Upstream suggests acting at 0.7 and above:
+
+```python
+calls, held = r["function_calls"], r["suppressed_calls"]
+if calls and r["confidence"] >= 0.7:
+    execute(calls)                           # sure: act
+elif calls or held:
+    confirm(calls or held, r["reasoning"])   # unsure: show the call, ask
+else:
+    say("I can't do that here")              # nothing to do: refuse
+```
+
+## Multi-turn
+
+Only needed when a later call depends on an earlier result ("create a note", then "delete that note"). Feed each tool result back as the next `input`, as a JSON string holding a list with one result per call, and list every earlier `input` in `history`:
+
+```python
+history = []
+
+r = complete(input="create a note titled groceries", history=history)
+results = [run(call) for call in r["function_calls"]]      # e.g. [{"note_id": 48213}]
+history.append("create a note titled groceries")
+
+r = complete(input=json.dumps(results), history=history)   # r["type"] == "respond"
+history.append(json.dumps(results))
+
+r = complete(input="actually delete that note", history=history)
+# -> delete_note(note_id=48213)
+```
+
+- `history` holds your inputs only: user text and tool-result JSON strings. Never put the model's answers in it. The server replays your inputs into a fresh engine session and the model regenerates its own side, deterministically.
+- Send the same `tools` and `system` for every request of one conversation.
+- Each replayed turn costs about as much as a normal request, so a long history is a slow request.
+- If `input` is a tool result, `history` must contain the request that led to it.
+
+## System facts
+
+`system` is a `key: value; key: value` string of facts. Recognised keys: `date`, `locale`, `device`, `battery`, `network`, `location`, `user`, `assistant`. Instructions ("You are a helpful assistant") do nothing useful.
+
+- The server adds today's date (`date: 2026-09-17 Thu`) unless your `system` already contains `date:`. Relative dates ("tomorrow") resolve against it. Send your own `date: 2026-09-17 Thu 14:30` if you need the time of day or another time zone.
+- `tools` and `system` together identify an engine. Keep both byte-identical between requests to stay on a warm engine. Do not put anything that changes per request (a timestamp, a request id) in `system`.
+
+## Designing tools
+
+- Five tools or fewer per request works best. Above five the engine picks the five most relevant per turn, and starting an engine for a big toolset is slow (about 1 s for 20 tools against 0.1 s for 3).
+- One tool per action, named the way a user would say it. Put formats in descriptions. Put constraints in the schema (`enum`, `minimum`, `maximum`, `pattern`), because the decode grammar enforces them.
+- A request for one product area should send only that area's tools. Different toolsets are cheap: that is what this server is for.
+
+## Limits and errors
+
+| Limit | Value |
+|---|---|
+| `input` length | 2,000 characters |
+| `input` plus replayed history | 4,000 characters |
+| replayed history turns | 6 (oldest dropped first) |
+| `tools` | 1 to 20, at most 32,000 characters of JSON |
+| `system` length | 500 characters |
+| time to answer | 5 s |
+
+Errors are `{"error": {"code": "...", "message": "..."}}`:
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 400 | `input_empty`, `input_too_long` | Fix the input. An over-long input is never cut, because half a command gives a confident wrong call. |
+| 400 | `tools_required`, `too_many_tools`, `tools_too_large`, `tools_invalid`, `tools_rejected` | Fix the tools. Every tool needs a string `name`, and `parameters` must be a JSON-schema object. `tools_rejected` means the engine could not load the schemas. |
+| 400 | `system_too_long`, `tool_result_without_history` | Fix the request. |
+| 422 | (FastAPI validation body) | A field is missing or has the wrong type. |
+| 429 | `queue_full` | The server is busy. Retry after the `Retry-After` header (seconds). |
+| 503 | `worker_failed`, `unavailable` | An engine failed or no memory is left. Retry. |
+| 504 | `deadline_exceeded` | The engine took too long. Send less text or fewer tools. |
+
+History that does not fit is dropped silently, oldest first, and counted in `server.dropped_history`.
+
+## Speed
+
+On an Apple M4 Pro: about 40 ms per request on a warm engine. The first request for a new toolset adds about 0.1 s (3 tools) to 1 s (20 tools). Two requests run at a time; the rest queue briefly. Idle engines stop after 10 minutes.
+
+## Other endpoints
+
+- `GET /health` - `{"status": "ok", "model": "needle3", "workers": ..., "busy": ..., "memory_mb": ..., "queued": ...}`; status 503 when the engine files are missing.
+- `GET /models` - `{"object": "list", "data": [{"id": "needle3", ...}]}`.
+- `GET /llms.txt` - this file. `GET /openapi.json` - the exact schema.
+
+## Minimal clients
+
+```sh
+curl -s http://localhost:4007/complete -H 'Content-Type: application/json' -d '{
+  "input": "lock the front door",
+  "tools": [{"name": "lock_door", "description": "Lock a door",
+             "parameters": {"type": "object", "properties": {"door": {"type": "string"}}, "required": ["door"]}}]
+}'
+```
+
+```python
+import httpx
+
+def complete(input, tools, system=None, history=()):
+    r = httpx.post("http://localhost:4007/complete", timeout=15,
+                   json={"input": input, "tools": tools, "system": system, "history": list(history)})
+    if r.status_code == 429:
+        raise RuntimeError(f"busy, retry in {r.headers['Retry-After']} s")
+    r.raise_for_status()
+    return r.json()
+```
+
+```ts
+async function complete(input: string, tools: object[], system?: string, history: string[] = []) {
+  const r = await fetch("http://localhost:4007/complete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ input, tools, system, history }),
+  });
+  if (!r.ok) throw new Error(`${r.status} ${(await r.json()).error?.code}`);
+  return r.json(); // { function_calls, confidence, suppressed_calls, reasoning, ... }
+}
+```
+
+## Common mistakes
+
+- Expecting a text answer. There is none, ever. An empty `function_calls` is the model saying no.
+- Executing `function_calls` without looking at `confidence`.
+- Putting the model's previous answers, or OpenAI-style message objects, in `history`. It takes your earlier inputs as plain strings.
+- Parsing `arguments` as a string. It is already an object.
+- Changing `system` on every request, which forces a new engine each time.
+- Sending every tool your app has. Send the few that fit the moment.

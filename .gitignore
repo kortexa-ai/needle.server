@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environment
+.venv/
+
+# Fetched by setup.sh: upstream runner binary and model weights
+engine/
+
+# OS
+.DS_Store
