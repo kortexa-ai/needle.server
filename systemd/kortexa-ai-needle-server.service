@@ -19,7 +19,7 @@ Environment=PYTHONPATH=/home/francip/src/needle.server
 
 ExecStart=/home/francip/src/needle.server/run.sh
 
-Restart=always
+Restart=no
 RestartSec=15
 
 TimeoutStopSec=30
